@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TOKEN="$(cat "$SCRIPT_DIR/ha-token.txt" | tr -d '[:space:]')"
+BASE="YOUR_HA_URL"
+AUTH="Authorization: Bearer $TOKEN"
+CT="Content-Type: application/json"
+
+cmd="${1:-help}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+  states)
+    curl -s -H "$AUTH" "$BASE/api/states" | python3 -c "
+import sys,json
+states=json.load(sys.stdin)
+for s in sorted(states, key=lambda x:x['entity_id']):
+    name=s.get('attributes',{}).get('friendly_name','')
+    print(f\"{s['entity_id']} | {name} | {s['state']}\")
+"
+    ;;
+
+  state)
+    entity="$1"
+    curl -s -H "$AUTH" "$BASE/api/states/$entity" | python3 -c "
+import sys,json
+s=json.load(sys.stdin)
+print(json.dumps(s, indent=2))
+"
+    ;;
+
+  list)
+    domain="$1"
+    curl -s -H "$AUTH" "$BASE/api/states" | python3 -c "
+import sys,json
+domain='$domain'
+states=json.load(sys.stdin)
+for s in sorted(states, key=lambda x:x['entity_id']):
+    if s['entity_id'].startswith(domain+'.'):
+        name=s.get('attributes',{}).get('friendly_name','')
+        state=s['state']
+        attrs=s.get('attributes',{})
+        extra=''
+        if domain=='light' and state=='on':
+            b=attrs.get('brightness','')
+            if b: extra=f' brightness={b}'
+        if domain=='climate':
+            ct=attrs.get('current_temperature','')
+            tt=attrs.get('temperature','')
+            if ct: extra+=f' current={ct}'
+            if tt: extra+=f' target={tt}'
+        print(f'{s[\"entity_id\"]} | {name} | {state}{extra}')
+"
+    ;;
+
+  on)
+    entity="$1"
+    domain="${entity%%.*}"
+    curl -s -X POST -H "$AUTH" -H "$CT" -d "{\"entity_id\":\"$entity\"}" "$BASE/api/services/$domain/turn_on"
+    echo "Turned on $entity"
+    ;;
+
+  off)
+    entity="$1"
+    domain="${entity%%.*}"
+    curl -s -X POST -H "$AUTH" -H "$CT" -d "{\"entity_id\":\"$entity\"}" "$BASE/api/services/$domain/turn_off"
+    echo "Turned off $entity"
+    ;;
+
+  toggle)
+    entity="$1"
+    domain="${entity%%.*}"
+    curl -s -X POST -H "$AUTH" -H "$CT" -d "{\"entity_id\":\"$entity\"}" "$BASE/api/services/$domain/toggle"
+    echo "Toggled $entity"
+    ;;
+
+  climate)
+    entity="$1"
+    temp="$2"
+    curl -s -X POST -H "$AUTH" -H "$CT" -d "{\"entity_id\":\"$entity\",\"temperature\":$temp}" "$BASE/api/services/climate/set_temperature"
+    echo "Set $entity to ${temp}°"
+    ;;
+
+  lock)
+    entity="$1"
+    curl -s -X POST -H "$AUTH" -H "$CT" -d "{\"entity_id\":\"$entity\"}" "$BASE/api/services/lock/lock"
+    echo "Locked $entity"
+    ;;
+
+  unlock)
+    entity="$1"
+    curl -s -X POST -H "$AUTH" -H "$CT" -d "{\"entity_id\":\"$entity\"}" "$BASE/api/services/lock/unlock"
+    echo "Unlocked $entity"
+    ;;
+
+  call)
+    domain="$1"
+    service="$2"
+    entity="$3"
+    data="${4:-{}}"
+    if [ "$data" = "{}" ]; then
+      data="{\"entity_id\":\"$entity\"}"
+    else
+      data=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); d['entity_id']='$entity'; print(json.dumps(d))")
+    fi
+    curl -s -X POST -H "$AUTH" -H "$CT" -d "$data" "$BASE/api/services/$domain/$service"
+    echo "Called $domain.$service on $entity"
+    ;;
+
+  history)
+    entity="$1"
+    end=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    start=$(date -u -v-24H +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "24 hours ago" +"%Y-%m-%dT%H:%M:%SZ")
+    curl -s -H "$AUTH" "$BASE/api/history/period/$start?end_time=$end&filter_entity_id=$entity" | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+if data and data[0]:
+    for entry in data[0][-20:]:
+        ts=entry.get('last_changed','')[:19]
+        print(f\"{ts} | {entry['state']}\")
+else:
+    print('No history found')
+"
+    ;;
+
+  scenes)
+    curl -s -H "$AUTH" "$BASE/api/states" | python3 -c "
+import sys,json
+states=json.load(sys.stdin)
+for s in sorted(states, key=lambda x:x['entity_id']):
+    if s['entity_id'].startswith('scene.'):
+        name=s.get('attributes',{}).get('friendly_name','')
+        print(f\"{s['entity_id']} | {name}\")
+"
+    ;;
+
+  scene)
+    entity="$1"
+    curl -s -X POST -H "$AUTH" -H "$CT" -d "{\"entity_id\":\"$entity\"}" "$BASE/api/services/scene/turn_on"
+    echo "Activated scene $entity"
+    ;;
+
+  automations)
+    curl -s -H "$AUTH" "$BASE/api/states" | python3 -c "
+import sys,json
+states=json.load(sys.stdin)
+for s in sorted(states, key=lambda x:x['entity_id']):
+    if s['entity_id'].startswith('automation.'):
+        name=s.get('attributes',{}).get('friendly_name','')
+        print(f\"{s['entity_id']} | {name} | {s['state']}\")
+"
+    ;;
+
+  trigger)
+    entity="$1"
+    curl -s -X POST -H "$AUTH" -H "$CT" -d "{\"entity_id\":\"$entity\"}" "$BASE/api/services/automation/trigger"
+    echo "Triggered $entity"
+    ;;
+
+  help|*)
+    echo "Usage: ha <command> [args]"
+    echo ""
+    echo "Commands:"
+    echo "  states                     List all entity states"
+    echo "  state <entity>             Get detailed entity state"
+    echo "  list <domain>              List entities by domain"
+    echo "  on <entity>                Turn on"
+    echo "  off <entity>               Turn off"
+    echo "  toggle <entity>            Toggle"
+    echo "  climate <entity> <temp>    Set temperature"
+    echo "  lock <entity>              Lock"
+    echo "  unlock <entity>            Unlock"
+    echo "  call <domain> <svc> <eid>  Call any service"
+    echo "  history <entity>           Last 24h history"
+    echo "  scenes                     List scenes"
+    echo "  scene <entity>             Activate scene"
+    echo "  automations                List automations"
+    echo "  trigger <entity>           Trigger automation"
+    ;;
+esac

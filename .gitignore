@@ -1,0 +1,5 @@
+*.env.local
+*.secret
+trade-log.json
+signals.json
+daily-plan.json

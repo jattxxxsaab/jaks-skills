@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/alpaca-keys.env"
+
+TRADE_LOG="$SCRIPT_DIR/trade-log.json"
+[ -f "$TRADE_LOG" ] || echo '[]' > "$TRADE_LOG"
+
+# --- helpers ---
+api() {
+  local method="$1" path="$2"; shift 2
+  curl -s -X "$method" \
+    -H "APCA-API-KEY-ID: $ALPACA_API_KEY" \
+    -H "APCA-API-SECRET-KEY: $ALPACA_SECRET_KEY" \
+    -H "Content-Type: application/json" \
+    "$@" "${ALPACA_BASE_URL}/v2${path}"
+}
+
+data_api() {
+  local method="$1" path="$2"; shift 2
+  curl -s -X "$method" \
+    -H "APCA-API-KEY-ID: $ALPACA_API_KEY" \
+    -H "APCA-API-SECRET-KEY: $ALPACA_SECRET_KEY" \
+    "$@" "${ALPACA_DATA_URL}${path}"
+}
+
+log_trade() {
+  local action="$1" symbol="$2" qty="$3" details="$4"
+  local ts; ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  local entry="{\"timestamp\":\"$ts\",\"action\":\"$action\",\"symbol\":\"$symbol\",\"qty\":\"$qty\",\"details\":$details}"
+  # Append to JSON array
+  local tmp; tmp=$(jq ". + [$entry]" "$TRADE_LOG" 2>/dev/null || echo "[$entry]")
+  echo "$tmp" > "$TRADE_LOG"
+}
+
+check_daily_loss() {
+  local acct; acct=$(api GET /account)
+  local equity; equity=$(echo "$acct" | jq -r '.equity // "0"')
+  local last_equity; last_equity=$(echo "$acct" | jq -r '.last_equity // "0"')
+  local loss; loss=$(echo "$last_equity - $equity" | bc 2>/dev/null || echo "0")
+  if (( $(echo "$loss > $ALPACA_DAILY_LOSS_LIMIT" | bc -l 2>/dev/null || echo 0) )); then
+    echo "⛔ Daily loss limit reached (\$$loss > \$$ALPACA_DAILY_LOSS_LIMIT). Trade blocked."
+    exit 1
+  fi
+}
+
+check_trade_size() {
+  local qty="$1" price="$2"
+  if [ -n "$price" ] && [ "$price" != "null" ] && [ "$price" != "0" ]; then
+    local value; value=$(echo "$qty * $price" | bc -l 2>/dev/null || echo "0")
+    if (( $(echo "$value > $ALPACA_MAX_TRADE_VALUE" | bc -l 2>/dev/null || echo 0) )); then
+      echo "⛔ Trade value \$$value exceeds max \$$ALPACA_MAX_TRADE_VALUE. Aborting."
+      exit 1
+    fi
+  fi
+}
+
+fmt_account() {
+  jq -r '"💰 Account Summary
+━━━━━━━━━━━━━━━━━━━━
+  Cash:          $" + .cash +
+  "\n  Equity:        $" + .equity +
+  "\n  Buying Power:  $" + .buying_power +
+  "\n  Portfolio:     $" + .portfolio_value +
+  "\n  Last Equity:   $" + .last_equity +
+  "\n  Status:        " + .status +
+  "\n  Day Trade Count: " + (.daytrade_count // 0 | tostring) +
+  "\n  Crypto:        " + (.crypto_status // "N/A")'
+}
+
+fmt_positions() {
+  jq -r 'if length == 0 then "📭 No open positions"
+  else "📊 Open Positions\n━━━━━━━━━━━━━━━━━━━━" + 
+  (map("\n  " + .symbol + ": " + .qty + " shares @ $" + .avg_entry_price + 
+  " → $" + .current_price + " (P&L: $" + .unrealized_pl + " / " + .unrealized_plpc + "%)") | join(""))
+  end'
+}
+
+fmt_orders() {
+  jq -r 'if length == 0 then "📭 No recent orders"
+  else "📋 Recent Orders\n━━━━━━━━━━━━━━━━━━━━" +
+  (map("\n  " + .id[:8] + "… " + .side + " " + (.qty // .notional // "?") + " " + .symbol + 
+  " " + .type + " " + .status + " @ " + (.filled_avg_price // .limit_price // "market")) | join(""))
+  end'
+}
+
+# --- commands ---
+cmd_account() { api GET /account | fmt_account; }
+
+cmd_positions() { api GET /positions | fmt_positions; }
+
+cmd_orders() { api GET "/orders?status=all&limit=20" | fmt_orders; }
+
+cmd_history() { api GET "/account/activities/FILL?limit=20" | jq -r '.[] | .transaction_time[:19] + " " + .side + " " + .qty + " " + .symbol + " @ $" + .price'; }
+
+cmd_quote() {
+  local symbol="$1"
+  if [[ "$symbol" == *"/"* ]]; then
+    # Crypto
+    local encoded="${symbol/\//%2F}"
+    data_api GET "/v1beta3/crypto/us/latest/quotes?symbols=$encoded" | jq -r ".quotes.\"$symbol\" // empty | \"📈 $symbol\n  Bid: \$\" + (.bp|tostring) + \" (\" + (.bs|tostring) + \")\n  Ask: \$\" + (.ap|tostring) + \" (\" + (.as|tostring) + \")\""
+    if [ "${PIPESTATUS[0]:-0}" != "0" ]; then
+      echo "Failed to get crypto quote for $symbol"
+    fi
+  else
+    data_api GET "/v2/stocks/$symbol/quotes/latest" | jq -r '"📈 '"$symbol"'\n  Bid: $" + (.quote.bp|tostring) + " (" + (.quote.bs|tostring) + ")\n  Ask: $" + (.quote.ap|tostring) + " (" + (.quote.as|tostring) + ")\n  Spread: $" + ((.quote.ap - .quote.bp)|tostring)'
+  fi
+}
+
+cmd_bars() {
+  local symbol="$1"; shift
+  local timeframe="1Day" limit="10"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeframe) timeframe="$2"; shift 2;;
+      --limit) limit="$2"; shift 2;;
+      *) shift;;
+    esac
+  done
+  if [[ "$symbol" == *"/"* ]]; then
+    local encoded="${symbol/\//%2F}"
+    data_api GET "/v1beta3/crypto/us/bars?symbols=$encoded&timeframe=$timeframe&limit=$limit" | jq -r ".bars.\"$symbol\"[] | .t[:10] + \" O:\" + (.o|tostring) + \" H:\" + (.h|tostring) + \" L:\" + (.l|tostring) + \" C:\" + (.c|tostring) + \" V:\" + (.v|tostring)"
+  else
+    data_api GET "/v2/stocks/$symbol/bars?timeframe=$timeframe&limit=$limit" | jq -r '.bars[] | .t[:10] + " O:" + (.o|tostring) + " H:" + (.h|tostring) + " L:" + (.l|tostring) + " C:" + (.c|tostring) + " V:" + (.v|tostring)'
+  fi
+}
+
+submit_order() {
+  local side="$1" symbol="$2" qty="$3"; shift 3
+  local limit_price="" stop_price="" order_type="market" tif="day"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit) limit_price="$2"; order_type="limit"; shift 2;;
+      --stop) stop_price="$2"; order_type="stop"; shift 2;;
+      --tif) tif="$2"; shift 2;;
+      *) shift;;
+    esac
+  done
+  if [ -n "$limit_price" ] && [ -n "$stop_price" ]; then order_type="stop_limit"; fi
+
+  check_daily_loss
+
+  # Build JSON
+  local body="{\"symbol\":\"$symbol\",\"qty\":\"$qty\",\"side\":\"$side\",\"type\":\"$order_type\",\"time_in_force\":\"$tif\""
+  [ -n "$limit_price" ] && body="$body,\"limit_price\":\"$limit_price\""
+  [ -n "$stop_price" ] && body="$body,\"stop_price\":\"$stop_price\""
+  body="$body}"
+
+  local result; result=$(api POST /orders -d "$body")
+  local oid; oid=$(echo "$result" | jq -r '.id // empty')
+  if [ -n "$oid" ]; then
+    log_trade "$side" "$symbol" "$qty" "$result"
+    echo "✅ Order submitted: $side $qty $symbol ($order_type)"
+    echo "   Order ID: $oid"
+    echo "$result" | jq -r '"   Status: " + .status'
+  else
+    echo "❌ Order failed:"
+    echo "$result" | jq -r '.message // .'
+  fi
+}
+
+cmd_buy() { submit_order "buy" "$@"; }
+cmd_sell() { submit_order "sell" "$@"; }
+cmd_short() { submit_order "sell" "$1" "$2" --tif day; }
+
+cmd_buy_crypto() {
+  local symbol="$1" qty="$2"
+  local body="{\"symbol\":\"${symbol/\//}\",\"qty\":\"$qty\",\"side\":\"buy\",\"type\":\"market\",\"time_in_force\":\"gtc\"}"
+  local result; result=$(api POST /orders -d "$body")
+  local oid; oid=$(echo "$result" | jq -r '.id // empty')
+  if [ -n "$oid" ]; then
+    log_trade "buy-crypto" "$symbol" "$qty" "$result"
+    echo "✅ Crypto buy: $qty $symbol | Order: $oid"
+  else
+    echo "❌ Failed:"; echo "$result" | jq -r '.message // .'
+  fi
+}
+
+cmd_sell_crypto() {
+  local symbol="$1" qty="$2"
+  local body="{\"symbol\":\"${symbol/\//}\",\"qty\":\"$qty\",\"side\":\"sell\",\"type\":\"market\",\"time_in_force\":\"gtc\"}"
+  local result; result=$(api POST /orders -d "$body")
+  local oid; oid=$(echo "$result" | jq -r '.id // empty')
+  if [ -n "$oid" ]; then
+    log_trade "sell-crypto" "$symbol" "$qty" "$result"
+    echo "✅ Crypto sell: $qty $symbol | Order: $oid"
+  else
+    echo "❌ Failed:"; echo "$result" | jq -r '.message // .'
+  fi
+}
+
+cmd_close() {
+  local symbol="$1"
+  local result; result=$(curl -s -X DELETE \
+    -H "APCA-API-KEY-ID: $ALPACA_API_KEY" \
+    -H "APCA-API-SECRET-KEY: $ALPACA_SECRET_KEY" \
+    "${ALPACA_BASE_URL}/v2/positions/$symbol")
+  log_trade "close" "$symbol" "all" "$result"
+  echo "✅ Closed position: $symbol"
+  echo "$result" | jq -r '"   Status: " + .status' 2>/dev/null || echo "$result"
+}
+
+cmd_close_all() {
+  local result; result=$(curl -s -X DELETE \
+    -H "APCA-API-KEY-ID: $ALPACA_API_KEY" \
+    -H "APCA-API-SECRET-KEY: $ALPACA_SECRET_KEY" \
+    "${ALPACA_BASE_URL}/v2/positions")
+  echo "✅ Close-all submitted"
+  echo "$result" | jq '.' 2>/dev/null || echo "$result"
+}
+
+cmd_cancel() {
+  local oid="$1"
+  api DELETE "/orders/$oid"
+  echo "✅ Cancelled order: $oid"
+}
+
+cmd_cancel_all() {
+  api DELETE /orders
+  echo "✅ All open orders cancelled"
+}
+
+cmd_watch() {
+  local symbol="$1"; shift
+  local above="" below=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --above) above="$2"; shift 2;;
+      --below) below="$2"; shift 2;;
+      *) shift;;
+    esac
+  done
+  # Get current price
+  local price
+  if [[ "$symbol" == *"/"* ]]; then
+    local encoded="${symbol/\//%2F}"
+    price=$(data_api GET "/v1beta3/crypto/us/latest/quotes?symbols=$encoded" | jq -r ".quotes.\"$symbol\".ap // 0")
+  else
+    price=$(data_api GET "/v2/stocks/$symbol/quotes/latest" | jq -r '.quote.ap // 0')
+  fi
+  local triggered="false" condition=""
+  if [ -n "$above" ]; then
+    condition="above $above"
+    (( $(echo "$price >= $above" | bc -l) )) && triggered="true"
+  fi
+  if [ -n "$below" ]; then
+    condition="below $below"
+    (( $(echo "$price <= $below" | bc -l) )) && triggered="true"
+  fi
+  jq -n --arg symbol "$symbol" --arg price "$price" --arg condition "$condition" --arg triggered "$triggered" \
+    '{symbol:$symbol, current_price:($price|tonumber), condition:$condition, triggered:($triggered=="true"), timestamp:now|todate}'
+}
+
+# --- dispatch ---
+cmd="${1:-help}"; shift 2>/dev/null || true
+case "$cmd" in
+  account)    cmd_account;;
+  positions)  cmd_positions;;
+  orders)     cmd_orders;;
+  history)    cmd_history;;
+  quote)      cmd_quote "$@";;
+  bars)       cmd_bars "$@";;
+  buy)        cmd_buy "$@";;
+  sell)       cmd_sell "$@";;
+  short)      cmd_short "$@";;
+  buy-crypto) cmd_buy_crypto "$@";;
+  sell-crypto) cmd_sell_crypto "$@";;
+  close)      cmd_close "$@";;
+  close-all)  cmd_close_all;;
+  cancel)     cmd_cancel "$@";;
+  cancel-all) cmd_cancel_all;;
+  watch)      cmd_watch "$@";;
+  *)
+    echo "Usage: trade <command> [args]"
+    echo ""
+    echo "Commands:"
+    echo "  account              Show account info"
+    echo "  positions            List open positions"
+    echo "  orders               List recent orders"
+    echo "  history              Recent fills"
+    echo "  quote SYMBOL         Get current quote"
+    echo "  bars SYMBOL          Get price bars"
+    echo "  buy SYMBOL QTY       Buy shares"
+    echo "  sell SYMBOL QTY      Sell shares"
+    echo "  short SYMBOL QTY     Short sell"
+    echo "  buy-crypto SYM QTY   Buy crypto"
+    echo "  sell-crypto SYM QTY  Sell crypto"
+    echo "  close SYMBOL         Close position"
+    echo "  close-all            Close all positions"
+    echo "  cancel ORDER_ID      Cancel order"
+    echo "  cancel-all           Cancel all orders"
+    echo "  watch SYM --above/--below PRICE"
+    echo ""
+    echo "Options: --limit PRICE, --stop PRICE, --timeframe 1Day, --limit 10"
+    ;;
+esac
