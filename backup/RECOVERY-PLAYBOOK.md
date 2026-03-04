@@ -9,14 +9,16 @@
 4. Install tools: `brew install gh steipete/tap/sag`
 
 ### Step 2: Restore Workspace (5 min)
-1. Sign into iCloud — backup files sync automatically to `~/Library/Mobile Documents/com~apple~CloudDocs/OpenClaw-Backup/`
-2. Or clone from GitHub:
+1. Install gog CLI: `brew install steipete/tap/gog`
+2. Auth Google Drive: `GOG_ACCOUNT=jimmy@apexrealty.io gog auth login --services="gmail,calendar,drive"`
+3. Download backups: `GOG_ACCOUNT=jimmy@apexrealty.io gog drive search "OpenClaw-Backup"` then download latest tarball
+4. Or clone from GitHub:
    - `gh auth login`
    - `git clone https://github.com/jattxxxsaab/jaks-skills.git`
    - `git clone https://github.com/jattxxxsaab/jaks-dashboard.git`
    - `git clone https://github.com/jattxxxsaab/str-tracker.git`
-3. Copy workspace from iCloud backup to `~/.openclaw/workspace/`
-4. Copy openclaw.json from iCloud backup to `~/.openclaw/`
+5. Extract workspace tarball to `~/.openclaw/workspace/`
+6. Copy openclaw.json to `~/.openclaw/`
 
 ### Step 3: Decrypt Secrets (2 min)
 ```bash
@@ -54,7 +56,7 @@ openclaw gateway start
 | AirDNA | jimmybhullar26@gmail.com |
 
 ## Backup Locations
-- **iCloud Drive**: `~/Library/Mobile Documents/com~apple~CloudDocs/OpenClaw-Backup/`
+- **Google Drive**: "OpenClaw-Backup" folder (jimmy@apexrealty.io)
 - **Local**: `~/Documents/openclaw_backup/` and `~/openclaw-backup/`
 - **GitHub**: github.com/jattxxxsaab/jaks-skills
 
