@@ -20,11 +20,43 @@
 5. Extract workspace tarball to `~/.openclaw/workspace/`
 6. Copy openclaw.json to `~/.openclaw/`
 
-### Step 3: Decrypt Secrets (2 min)
+### Step 3: Decrypt Secrets Vault (2 min)
+
+The encrypted vault contains ALL API keys, passwords, tokens, and credentials needed to restore every service.
+
+**Location of encrypted file:**
+- iCloud Drive: `~/Library/Mobile Documents/com~apple~CloudDocs/OpenClaw-Backup/secrets.enc`
+- Local backup: `~/Documents/openclaw_backup/secrets.enc`
+- Workspace: `skills/backup/secrets.enc`
+
+**To decrypt:**
 ```bash
 openssl enc -aes-256-cbc -d -pbkdf2 -in secrets.enc -out secrets.md -pass pass:JaksBackup2026!
 ```
-Use the decrypted file to restore all API keys and passwords.
+
+**To verify it decrypted correctly:**
+```bash
+cat secrets.md | head -10
+# You should see "# 🔐 Jaks Secrets Vault" at the top
+```
+
+**What's inside:**
+- Alpaca API key & secret (PaperPaws trading bot)
+- ElevenLabs API key & voice IDs
+- Home Assistant URL & long-lived token
+- IHSS provider & recipient login credentials
+- AirDNA login
+- Gmail accounts
+- Telegram bot token
+- Phone numbers (Jimmy, Amar)
+- GitHub username
+
+**After restoring, delete the plaintext:**
+```bash
+rm secrets.md
+```
+
+Use these credentials to fill in the placeholder values in each skill's config files.
 
 ### Step 4: Authenticate Services (5 min)
 1. `openclaw configure` — set up Anthropic API key
