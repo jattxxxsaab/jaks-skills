@@ -3,3 +3,5 @@
 trade-log.json
 signals.json
 daily-plan.json
+secrets.enc
+secrets-template.md
